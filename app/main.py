@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, status
+import pybreaker
 import httpx
 import os
 from pydantic import BaseModel, Field
@@ -6,6 +7,44 @@ from pydantic import BaseModel, Field
 app = FastAPI(title="Service C - Orders API")
 
 SERVICE_A_BASE_URL = os.getenv("SERVICE_A_BASE_URL", "http://service_a:8000")
+
+PARTS_BASE_URL = os.getenv("PARTS_BASE_URL", "http://service_a:8000")
+
+# Circuit breaker:
+parts_breaker = pybreaker.CircuitBreaker(fail_max=3, reset_timeout=20)
+
+
+def fetch_part_from_parts_service(part_id: int) -> dict:
+    """Synchronous call (simple + works great with pybreaker)."""
+    url = f"{PARTS_BASE_URL}/api/parts/{part_id}"
+   
+    with httpx.Client(timeout=2.0) as client:
+        r = client.get(url)
+
+    if r.status_code == 404:
+        raise HTTPException(status_code=400, detail="Part does not exist")
+    if r.status_code >= 400:       
+        raise RuntimeError(f"Parts service error: {r.status_code}")
+
+    return r.json()
+
+
+def get_part_with_circuit_breaker(part_id: int) -> dict:
+    """
+    If breaker is OPEN, return fallback immediately.
+    If breaker is CLOSED/HALF-OPEN, attempt the real call.
+    """
+    try:
+        return parts_breaker.call(fetch_part_from_parts_service, part_id)
+    except pybreaker.CircuitBreakerError:      
+        raise HTTPException(
+            status_code=503,
+            detail="Parts service temporarily unavailable (circuit breaker open). Try again shortly."
+        )
+    except HTTPException:      
+        raise
+    except Exception:       
+        raise HTTPException(status_code=503, detail="Parts service unavailable")
 
 class OrderCreate(BaseModel):
     user_id: int = Field(..., ge=1)
@@ -45,28 +84,9 @@ def get_order(order_id: int):
 
 @app.post("/api/orders", response_model=OrderOut, status_code=status.HTTP_201_CREATED)
 async def create_order(payload: OrderCreate):
-    """
-    Create an order and synchronously call Service A (Parts service) to:
-    - confirm the part exists
-    - check stock
-    - get current price
-    """
     global next_id
-
-    part_url = f"{SERVICE_A_BASE_URL}/api/parts/{payload.part_id}"
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            r = await client.get(part_url)
-    except httpx.RequestError:
-        raise HTTPException(status_code=503, detail="Parts service unavailable")
-
-    if r.status_code == 404:
-        raise HTTPException(status_code=400, detail="Part does not exist")
-    if r.status_code != 200:
-        raise HTTPException(status_code=502, detail="Unexpected response from Parts service")
-
-    part = r.json()
+    
+    part = get_part_with_circuit_breaker(payload.part_id)
 
     stock = part.get("stock")
     price = part.get("price")
@@ -86,6 +106,7 @@ async def create_order(payload: OrderCreate):
         total_price=float(price) * payload.quantity,
         status="created",
     )
+
     next_id += 1
     orders.append(order)
     return order
